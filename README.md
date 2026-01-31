@@ -4,6 +4,8 @@ Fuzzy search through video subtitles with [fzf](https://github.com/junegunn/fzf)
 
 Press `/` to open a searchable list of all subtitle lines. Select one to jump directly to that point in the video.
 
+![demo](demo.gif)
+
 > **Note**: Currently Windows-only. Linux/macOS support would require modifying the terminal spawning logic.
 
 ## Features
