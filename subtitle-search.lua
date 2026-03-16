@@ -3,11 +3,17 @@
 
 local utils = require("mp.utils")
 
+math.randomseed(os.time())
+
 -- Cache for parsed subtitles
 local cache = {
     path = nil,
     entries = nil
 }
+
+-- State for active fzf session
+local fzf_active = false
+local sync_timer = nil
 
 local function parse_time(time_str)
     local h, m, s, ms = time_str:match("(%d+):(%d+):(%d+)[.,](%d+)")
@@ -144,7 +150,23 @@ local function deduplicate_entries(entries)
     return result
 end
 
+local function find_closest_index(entries, target_time)
+    if not target_time or #entries == 0 then return 1 end
+    local best = 1
+    for i, entry in ipairs(entries) do
+        if math.abs(entry.time - target_time) < math.abs(entries[best].time - target_time) then
+            best = i
+        end
+        if entry.time > target_time then
+            break
+        end
+    end
+    return best
+end
+
 local function search_subtitles()
+    if fzf_active then return end
+
     local current_path = mp.get_property("path")
     local entries
 
@@ -187,11 +209,17 @@ local function search_subtitles()
         cache.entries = entries
     end
 
+    -- Get current playback position and find closest subtitle
+    local current_pos = mp.get_property_number("time-pos") or 0
+    local initial_index = find_closest_index(entries, current_pos)
+
     local temp_dir = os.getenv("TEMP") or "C:\\Temp"
     local timestamp = os.time()
     local subs_file = temp_dir .. "\\mpv_subs_" .. timestamp .. ".txt"
     local result_file = temp_dir .. "\\mpv_result_" .. timestamp .. ".txt"
     local batch_file = temp_dir .. "\\mpv_fzf_" .. timestamp .. ".bat"
+    local done_file = temp_dir .. "\\mpv_done_" .. timestamp .. ".txt"
+    local port = 20000 + math.random(0, 40000)
 
     -- Write subtitle entries
     local f = io.open(subs_file, "w")
@@ -204,50 +232,82 @@ local function search_subtitles()
     end
     f:close()
 
-    -- Write batch file
+    -- Write batch file with --listen for live sync
     local bf = io.open(batch_file, "w")
     if not bf then
         mp.osd_message("Failed to create batch file", 2)
         return
     end
     bf:write('@echo off\n')
-    bf:write('type "' .. subs_file .. '" | fzf --layout=reverse --prompt="Search: " > "' .. result_file .. '" 2>nul\n')
+    bf:write('type "' .. subs_file .. '" | fzf --layout=reverse --prompt="Search: " --listen=localhost:' .. port .. ' --bind "load:pos(' .. initial_index .. ')" > "' .. result_file .. '" 2>nul\n')
+    bf:write('echo done > "' .. done_file .. '"\n')
     bf:write('exit /b 0\n')
     bf:close()
 
-    -- Run in conhost (synchronous, waits for completion)
-    local cmd = 'conhost cmd /c "' .. batch_file .. '"'
-    os.execute(cmd)
+    fzf_active = true
 
-    -- Read result
-    local rf = io.open(result_file, "r")
-    if rf then
-        local result = rf:read("*line")
-        rf:close()
+    -- Launch fzf asynchronously (start returns immediately)
+    os.execute('start "" conhost cmd /c "' .. batch_file .. '"')
 
-        if result and #result > 0 then
-            local time_str = result:match("^([%d:]+)")
-            if time_str then
-                local parts = {}
-                for part in time_str:gmatch("%d+") do
-                    table.insert(parts, tonumber(part))
+    -- Timer: sync cursor position and detect when fzf exits
+    local last_idx = initial_index
+    sync_timer = mp.add_periodic_timer(0.5, function()
+        -- Check if fzf has exited
+        local df = io.open(done_file, "r")
+        if df then
+            df:close()
+            fzf_active = false
+            sync_timer:kill()
+            sync_timer = nil
+
+            -- Read result
+            local rf = io.open(result_file, "r")
+            if rf then
+                local line = rf:read("*line")
+                rf:close()
+
+                if line and #line > 0 then
+                    local time_str = line:match("^([%d:]+)")
+                    if time_str then
+                        local parts = {}
+                        for part in time_str:gmatch("%d+") do
+                            table.insert(parts, tonumber(part))
+                        end
+                        local seconds = 0
+                        if #parts == 3 then
+                            seconds = parts[1] * 3600 + parts[2] * 60 + parts[3]
+                        elseif #parts == 2 then
+                            seconds = parts[1] * 60 + parts[2]
+                        end
+                        mp.set_property_number("time-pos", seconds)
+                        mp.osd_message("Jumped to " .. time_str, 1)
+                    end
                 end
-                local seconds = 0
-                if #parts == 3 then
-                    seconds = parts[1] * 3600 + parts[2] * 60 + parts[3]
-                elseif #parts == 2 then
-                    seconds = parts[1] * 60 + parts[2]
-                end
-                mp.set_property_number("time-pos", seconds)
-                mp.osd_message("Jumped to " .. time_str, 1)
+            end
+
+            -- Cleanup
+            os.remove(subs_file)
+            os.remove(result_file)
+            os.remove(batch_file)
+            os.remove(done_file)
+            return
+        end
+
+        -- Sync: update fzf cursor to follow playback (only if position changed)
+        local pos = mp.get_property_number("time-pos")
+        if pos then
+            local idx = find_closest_index(entries, pos)
+            if idx ~= last_idx then
+                last_idx = idx
+                mp.command_native_async({
+                    name = "subprocess",
+                    args = {"curl.exe", "-s", "--connect-timeout", "1", "-X", "POST", "http://localhost:" .. port, "-d", "pos(" .. idx .. ")"},
+                    capture_stdout = true,
+                    capture_stderr = true,
+                }, function() end)
             end
         end
-    end
-
-    -- Cleanup
-    os.remove(subs_file)
-    os.remove(result_file)
-    os.remove(batch_file)
+    end)
 end
 
 mp.add_key_binding("/", "subtitle-search", search_subtitles)
